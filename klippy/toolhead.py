@@ -376,6 +376,12 @@ class ToolHead:
         self.printer.register_event_handler(
             "klippy:shutdown", self._handle_shutdown
         )
+        # Native motion engine (optional, enabled via [danger_options])
+        self._native_engine = None
+        self._me_ffi = None
+        self._me_lib = None
+        if get_danger_options().native_motion_engine:
+            self._init_native_engine()
         # Load some default modules
         modules = [
             "gcode_move",
@@ -399,6 +405,126 @@ class ToolHead:
                     active_rails.append(rail)
                     break
         return active_rails
+
+    # Native motion engine support
+    #
+    # The native engine replaces ONLY the expensive LookAheadQueue.flush()
+    # — the O(n) backward pass that resolves junction speeds. Everything
+    # else (Move construction for check_move, _process_moves, step gen,
+    # MCU flush) stays in Python. These are thin C wrappers, not the
+    # bottleneck, and they have complex state tightly coupled to the
+    # reactor, clock sync, and homing subsystems.
+    #
+    # Flow: Python Move (for check_move) → native lookahead →
+    #       native flush (resolves velocity profiles) → apply to
+    #       Python Moves → existing _process_moves unchanged
+
+    def _init_native_engine(self):
+        me_ffi, me_lib = chelper.get_motion_ffi()
+        if me_lib is None:
+            logging.warning(
+                "Native motion engine requested but not available. "
+                "Falling back to Python motion planning."
+            )
+            return
+        self._me_ffi = me_ffi
+        self._me_lib = me_lib
+        self._native_engine = me_lib.motion_engine_create()
+        if self._native_engine is None:
+            logging.error("Failed to create native motion engine")
+            return
+        me_lib.motion_engine_set_velocity_limits(
+            self._native_engine,
+            self.max_velocity,
+            self.max_accel,
+            self.square_corner_velocity,
+            self.min_cruise_ratio,
+        )
+        # Parallel queue of Python Moves for _process_moves
+        self._native_move_queue = []
+        # Pre-allocate result buffer
+        self._flush_results = me_ffi.new("struct FlushedMoveResult[4096]")
+        logging.info("Native motion engine initialized")
+
+    def _native_move(self, newpos, speed):
+        """Move using native lookahead for junction speed resolution."""
+        move = Move(self, self.commanded_pos, newpos, speed)
+        if not move.move_d:
+            return
+        if move.is_kinematic_move:
+            self.kin.check_move(move)
+        if move.axes_d[3]:
+            self.extruder.check_move(move)
+        self.commanded_pos[:] = move.end_pos
+        # Queue in native engine (for junction calculation)
+        self._me_lib.motion_engine_queue_move_ex(
+            self._native_engine,
+            move.start_pos[0],
+            move.start_pos[1],
+            move.start_pos[2],
+            move.start_pos[3],
+            move.end_pos[0],
+            move.end_pos[1],
+            move.end_pos[2],
+            move.end_pos[3],
+            speed,
+            move.accel,
+            move.max_cruise_v2,
+            move.delta_v2,
+            move.smooth_delta_v2,
+            move.next_junction_v2,
+            1 if move.is_kinematic_move else 0,
+        )
+        # Keep Python Move for _process_moves
+        self._native_move_queue.append(move)
+        self.lookahead.junction_flush -= move.min_move_t
+        if self.lookahead.junction_flush <= 0.0:
+            self._native_flush(lazy=True)
+        if self.print_time > self.need_check_pause:
+            self._check_pause()
+
+    def _native_flush(self, lazy=False):
+        """Flush native lookahead, apply velocity profiles to Python
+        Moves, then run existing _process_moves unchanged."""
+        self.lookahead.junction_flush = LOOKAHEAD_FLUSH_TIME
+        queue = self._native_move_queue
+        if not queue:
+            return
+        count = self._me_lib.motion_engine_flush_and_extract(
+            self._native_engine,
+            self._flush_results,
+            min(len(queue), 4096),
+            1 if lazy else 0,
+        )
+        if count <= 0:
+            return
+        results = self._flush_results
+        moves = queue[:count]
+        for i in range(count):
+            r = results[i]
+            moves[i].set_junction(
+                r.start_v * r.start_v,
+                r.cruise_v * r.cruise_v,
+                r.end_v * r.end_v,
+            )
+        del queue[:count]
+        # Run existing _process_moves — handles trapq_append, extruder,
+        # step generators, MCU flush, timing callbacks. Unchanged.
+        self._process_moves(moves)
+
+    def _native_flush_lookahead(self):
+        """Full flush of native lookahead."""
+        self._native_flush(lazy=False)
+        self.special_queuing_state = "NeedPrime"
+        self.need_check_pause = -1.0
+        self.lookahead.set_flush_time(BUFFER_TIME_HIGH)
+        self.check_stall_time = 0.0
+
+    def _native_flush_step_generation(self):
+        """Flush everything including step generation."""
+        self._native_flush_lookahead()
+        self._advance_flush_time(self.step_gen_time)
+        self.min_restart_time = max(self.min_restart_time, self.print_time)
 
     # Print time and flush tracking
     def _advance_flush_time(self, flush_time):
@@ -494,6 +620,8 @@ class ToolHead:
         self._advance_move_time(next_move_time)
 
     def _flush_lookahead(self):
+        if self._native_engine is not None:
+            return self._native_flush_lookahead()
         # Transit from "NeedPrime"/"Priming"/"Drip"/main state to "NeedPrime"
         self.lookahead.flush()
         self.special_queuing_state = "NeedPrime"
@@ -502,11 +630,20 @@ class ToolHead:
         self.check_stall_time = 0.0
 
     def flush_step_generation(self):
+        if self._native_engine is not None:
+            return self._native_flush_step_generation()
         self._flush_lookahead()
         self._advance_flush_time(self.step_gen_time)
         self.min_restart_time = max(self.min_restart_time, self.print_time)
 
     def get_last_move_time(self):
+        if self._native_engine is not None:
+            if self.special_queuing_state:
+                self._native_flush_lookahead()
+                self._calc_print_time()
+            else:
+                self._native_flush(lazy=False)
+            return self.print_time
         if self.special_queuing_state:
             self._flush_lookahead()
             self._calc_print_time()
@@ -608,11 +745,16 @@ class ToolHead:
         self.printer.send_event("toolhead:set_position")
 
     def limit_next_junction_speed(self, speed):
+        if self._native_engine is not None and self._native_move_queue:
+            self._native_move_queue[-1].limit_next_junction_speed(speed)
+            return
         last_move = self.lookahead.get_last()
         if last_move is not None:
             last_move.limit_next_junction_speed(speed)
 
     def move(self, newpos, speed):
+        if self._native_engine is not None:
+            return self._native_move(newpos, speed)
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:
             return
@@ -677,6 +819,9 @@ class ToolHead:
 
     def drip_move(self, newpos, speed, drip_completion):
         self.dwell(self.kin_flush_delay)
+        # Drip moves must use Python path (special timing for homing)
+        saved_native = self._native_engine
+        self._native_engine = None
         # Transition from "NeedPrime"/"Priming"/main state to "Drip" state
         self.lookahead.flush()
         self.special_queuing_state = "Drip"
@@ -700,6 +845,7 @@ class ToolHead:
             self.lookahead.reset()
             self.trapq_finalize_moves(self.trapq, self.reactor.NEVER, 0)
         # Exit "Drip" state
+        self._native_engine = saved_native
         self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
         self.flush_step_generation()
 
@@ -747,6 +893,9 @@ class ToolHead:
     def _handle_shutdown(self):
         self.can_pause = False
         self.lookahead.reset()
+        if self._native_engine is not None:
+            self._me_lib.motion_engine_reset(self._native_engine)
+            self._native_move_queue.clear()
 
     def get_kinematics(self):
         return self.kin
@@ -788,6 +937,14 @@ class ToolHead:
         scv2 = self.square_corner_velocity**2
         self.junction_deviation = scv2 * (math.sqrt(2.0) - 1.0) / self.max_accel
         self.max_accel_to_decel = self.max_accel * (1.0 - self.min_cruise_ratio)
+        if getattr(self, "_native_engine", None) is not None:
+            self._me_lib.motion_engine_set_velocity_limits(
+                self._native_engine,
+                self.max_velocity,
+                self.max_accel,
+                self.square_corner_velocity,
+                self.min_cruise_ratio,
+            )
 
     def cmd_G4(self, gcmd):
         # Dwell

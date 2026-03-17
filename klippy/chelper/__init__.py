@@ -240,6 +240,76 @@ defs_std = """
     void free(void*);
 """
 
+defs_motion_engine = """
+    struct MotionEngine *motion_engine_create(void);
+    void motion_engine_destroy(struct MotionEngine *engine);
+    void motion_engine_reset(struct MotionEngine *engine);
+    void motion_engine_set_trapq(struct MotionEngine *engine
+        , struct trapq *tq);
+    int motion_engine_queue_move(struct MotionEngine *engine
+        , double x, double y, double z, double e, double speed);
+    int motion_engine_queue_move_ex(struct MotionEngine *engine
+        , double start_x, double start_y, double start_z, double start_e
+        , double end_x, double end_y, double end_z, double end_e
+        , double speed, double accel
+        , double max_cruise_v2, double delta_v2
+        , double smooth_delta_v2, double next_junction_v2
+        , int is_kinematic);
+    void motion_engine_flush(struct MotionEngine *engine);
+    void motion_engine_flush_step_generation(struct MotionEngine *engine);
+    double motion_engine_get_print_time(const struct MotionEngine *engine);
+    double motion_engine_get_buffer_time(const struct MotionEngine *engine
+        , double est_print_time);
+    void motion_engine_set_position(struct MotionEngine *engine
+        , double x, double y, double z, double e);
+    void motion_engine_set_velocity_limits(struct MotionEngine *engine
+        , double max_velocity, double max_accel
+        , double square_corner_velocity, double min_cruise_ratio);
+    uint32_t motion_engine_get_stall_count(const struct MotionEngine *engine);
+    void motion_engine_set_print_time(struct MotionEngine *engine
+        , double print_time);
+    void motion_engine_sync_state(struct MotionEngine *engine
+        , double print_time, double last_flush_time
+        , double min_restart_time, double need_flush_time
+        , double step_gen_time, double clear_history_time
+        , double pos_x, double pos_y, double pos_z, double pos_e);
+    void motion_engine_set_kin_flush_delay(struct MotionEngine *engine
+        , double delay);
+    double motion_engine_get_last_flush_time(const struct MotionEngine *engine);
+    uint32_t motion_engine_get_queue_len(const struct MotionEngine *engine);
+
+    void motion_engine_set_extruder_trapq(struct MotionEngine *engine
+        , struct trapq *tq);
+    void motion_engine_set_extruder_params(struct MotionEngine *engine
+        , double pressure_advance, double use_pa_from_trapq
+        , double instant_corner_v);
+    int motion_engine_add_stepper(struct MotionEngine *engine
+        , struct stepper_kinematics *sk);
+    int motion_engine_add_mcu(struct MotionEngine *engine
+        , struct steppersync *ss, double time_offset, double mcu_freq);
+    void motion_engine_update_mcu_clock(struct MotionEngine *engine
+        , uint32_t index, double time_offset, double mcu_freq);
+    void motion_engine_set_post_flush_cb(struct MotionEngine *engine
+        , void (*cb)(void *), void *ctx);
+
+    struct FlushedMoveResult {
+        double start_v, cruise_v, end_v;
+        double accel_t, cruise_t, decel_t;
+        double accel;
+    };
+    int motion_engine_flush_and_extract(struct MotionEngine *engine
+        , struct FlushedMoveResult *results, uint32_t max_results, int lazy);
+
+    struct ClockSync *clock_sync_create(double mcu_freq);
+    void clock_sync_destroy(struct ClockSync *cs);
+    void clock_sync_set_freq(struct ClockSync *cs, double mcu_freq);
+    double clock_sync_update(struct ClockSync *cs
+        , uint32_t clock32, double sent_time, double receive_time);
+    int64_t clock_sync_get_clock(const struct ClockSync *cs, double eventtime);
+    double clock_sync_estimated_print_time(const struct ClockSync *cs
+        , double eventtime);
+"""
+
 defs_all = [
     defs_pyhelper,
     defs_serialqueue,
@@ -340,6 +410,92 @@ def get_ffi():
         )
         FFI_lib.set_python_logging_callback(pyhelper_logging_callback)
     return FFI_main, FFI_lib
+
+
+######################################################################
+# Native motion engine (Zig)
+######################################################################
+
+ZIG_ENGINE_DIR = "zig_engine"
+ZIG_ENGINE_LIB = "libmotion_engine.so"
+
+ME_FFI_main = None
+ME_FFI_lib = None
+
+
+def _detect_arch():
+    """Detect CPU architecture for prebuilt binary selection."""
+    import platform
+
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "x86_64"
+    elif machine in ("aarch64", "arm64"):
+        return "aarch64"
+    elif machine.startswith("arm"):
+        return "armv7"
+    return None
+
+
+def get_motion_ffi():
+    """Load the Zig native motion engine library.
+    Tries prebuilt binaries first, then falls back to building from source.
+    Returns (ffi_main, ffi_lib) or (None, None) if not available.
+    """
+    global ME_FFI_main, ME_FFI_lib
+    if ME_FFI_lib is not None:
+        return ME_FFI_main, ME_FFI_lib
+    srcdir = os.path.dirname(os.path.realpath(__file__))
+    zigdir = os.path.join(srcdir, ZIG_ENGINE_DIR)
+    destlib = None
+    # 1. Try prebuilt binary for this architecture
+    arch = _detect_arch()
+    if arch is not None:
+        prebuilt = os.path.join(
+            zigdir, "prebuilt", "libmotion_engine-%s.so" % arch
+        )
+        if os.path.exists(prebuilt):
+            destlib = prebuilt
+            logging.info(
+                "Using prebuilt native motion engine for %s", arch
+            )
+    # 2. Try zig-out from a previous build
+    if destlib is None:
+        built = os.path.join(zigdir, "zig-out", "lib", ZIG_ENGINE_LIB)
+        if os.path.exists(built):
+            destlib = built
+    # 3. Try to build from source
+    if destlib is None:
+        import subprocess
+
+        logging.info("Building Zig motion engine %s", ZIG_ENGINE_LIB)
+        try:
+            subprocess.check_call(
+                ["zig", "build", "-Doptimize=ReleaseFast"],
+                cwd=zigdir,
+                timeout=120,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logging.warning(
+                "Failed to build Zig motion engine: %s. "
+                "Falling back to Python motion planning.",
+                e,
+            )
+            return None, None
+        built = os.path.join(zigdir, "zig-out", "lib", ZIG_ENGINE_LIB)
+        if os.path.exists(built):
+            destlib = built
+    if destlib is None:
+        logging.warning("Zig motion engine library not found")
+        return None, None
+    # Reuse the same FFI instance as get_ffi() so struct types match
+    # (CFFI rejects pointers across different FFI instances)
+    ffi_main, _ = get_ffi()
+    ffi_main.cdef(defs_motion_engine)
+    ME_FFI_main = ffi_main
+    ME_FFI_lib = ffi_main.dlopen(destlib)
+    logging.info("Loaded Zig native motion engine from %s", destlib)
+    return ME_FFI_main, ME_FFI_lib
 
 
 ######################################################################

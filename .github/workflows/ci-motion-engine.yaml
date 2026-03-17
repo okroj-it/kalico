@@ -1,0 +1,52 @@
+name: Build Motion Engine
+
+on:
+  push:
+    paths:
+      - 'klippy/chelper/zig_engine/src/**'
+      - 'klippy/chelper/zig_engine/build.zig'
+      - 'klippy/chelper/zig_engine/build.zig.zon'
+      - 'klippy/chelper/*.c'
+      - 'klippy/chelper/*.h'
+  pull_request:
+    paths:
+      - 'klippy/chelper/zig_engine/src/**'
+      - 'klippy/chelper/zig_engine/build.zig'
+      - 'klippy/chelper/zig_engine/build.zig.zon'
+      - 'klippy/chelper/*.c'
+      - 'klippy/chelper/*.h'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Run tests
+        working-directory: klippy/chelper/zig_engine
+        run: zig build test
+
+      - name: Build prebuilt binaries
+        working-directory: klippy/chelper/zig_engine
+        run: |
+          mkdir -p prebuilt
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu
+          cp zig-out/lib/libmotion_engine.so prebuilt/libmotion_engine-x86_64.so
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+          cp zig-out/lib/libmotion_engine.so prebuilt/libmotion_engine-aarch64.so
+          zig build -Doptimize=ReleaseFast -Dtarget=arm-linux-gnueabihf
+          cp zig-out/lib/libmotion_engine.so prebuilt/libmotion_engine-armv7.so
+          ls -lh prebuilt/
+
+      - name: Upload prebuilt binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: motion-engine-prebuilt
+          path: klippy/chelper/zig_engine/prebuilt/
+          retention-days: 90

@@ -67,6 +67,10 @@ class DangerOptions:
         self.override_pressure_advance_smooth_time_max = config.getfloat(
             "override_pressure_advance_smooth_time_max", 0.200, above=0.0
         )
+        # Native Zig motion engine (replaces Python motion planning hot path)
+        self.native_motion_engine = config.getboolean(
+            "native_motion_engine", False
+        )
 
 
 DANGER_OPTIONS: DangerOptions = None

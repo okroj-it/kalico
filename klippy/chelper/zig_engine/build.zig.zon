@@ -1,0 +1,12 @@
+.{
+    .name = .motion_engine,
+    .version = "0.1.0",
+    .fingerprint = 0xb528df9c2667f575,
+    .minimum_zig_version = "0.16.0-dev.2905+5d71e3051",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
