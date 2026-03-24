@@ -778,6 +778,97 @@ def test_multi_batch_flush():
     me_lib.motion_engine_destroy(eng)
 
 
+def test_flush_and_process_with_print_time():
+    """Verify flush_and_process uses synced print_time for trapq timestamps.
+
+    This tests the root cause of the K3 homing failure: moves queued after
+    drip_move must have correct print_time in the trapq, not stale values.
+    """
+    me_ffi, me_lib = get_zig_ffi()
+    c_ffi, c_lib = get_chelper_ffi()
+
+    trapq = c_lib.trapq_alloc()
+    eng = me_lib.motion_engine_create()
+    me_lib.motion_engine_set_velocity_limits(eng, 500.0, 3000.0, 5.0, 0.5)
+    me_lib.motion_engine_set_trapq(eng, trapq)
+
+    # Simulate: after homing, print_time is 5.0
+    me_lib.motion_engine_set_print_time(eng, 5.0)
+
+    # Queue a travel move (like beacon's move-to-center after XY home)
+    m = PyMove(**make_move_params([10, 10, 0, 0], [90, 90, 0, 0], 300.0))
+    me_lib.motion_engine_queue_move_ex(
+        eng,
+        m.start_pos[0], m.start_pos[1], m.start_pos[2], m.start_pos[3],
+        m.end_pos[0], m.end_pos[1], m.end_pos[2], m.end_pos[3],
+        300.0, m.accel, m.max_cruise_v2, m.delta_v2,
+        m.smooth_delta_v2, m.next_junction_v2,
+        1 if m.is_kinematic_move else 0,
+    )
+
+    buf = me_ffi.new("struct FlushedMoveResult[10]")
+    count = me_lib.motion_engine_flush_and_process(eng, buf, 10, 0)
+    assert count == 1, f"Expected 1 move, got {count}"
+
+    # Finalize to move entries from 'moves' list to 'history' (extractable)
+    c_lib.trapq_finalize_moves(trapq, 9999.0, 0.0)
+
+    # Check that trapq entries have print_time >= 5.0 (not 0)
+    entries = extract_trapq_moves(c_ffi, c_lib, trapq, 0, 9999)
+    assert len(entries) > 0, "No trapq entries"
+    for e in entries:
+        assert e["print_time"] >= 5.0, (
+            f"Trapq entry at print_time={e['print_time']:.3f}, "
+            f"expected >= 5.0 (stale print_time bug)"
+        )
+
+    c_lib.trapq_free(trapq)
+    me_lib.motion_engine_destroy(eng)
+
+
+def test_sync_state_then_flush():
+    """After sync_state (simulating drip_move exit), flush produces
+    correct trapq timestamps."""
+    me_ffi, me_lib = get_zig_ffi()
+    c_ffi, c_lib = get_chelper_ffi()
+
+    trapq = c_lib.trapq_alloc()
+    eng = me_lib.motion_engine_create()
+    me_lib.motion_engine_set_velocity_limits(eng, 500.0, 3000.0, 5.0, 0.5)
+    me_lib.motion_engine_set_trapq(eng, trapq)
+
+    # Simulate drip_move exit: sync all timing state
+    me_lib.motion_engine_sync_state(
+        eng, 8.5, 8.0, 7.5, 9.0, 8.8, 3.0,
+        10.0, 10.0, 5.0, 0.0,  # position after homing
+    )
+
+    # Queue a move from the homed position
+    m = PyMove(**make_move_params([10, 10, 5, 0], [90, 90, 5, 0], 300.0))
+    me_lib.motion_engine_queue_move_ex(
+        eng,
+        m.start_pos[0], m.start_pos[1], m.start_pos[2], m.start_pos[3],
+        m.end_pos[0], m.end_pos[1], m.end_pos[2], m.end_pos[3],
+        300.0, m.accel, m.max_cruise_v2, m.delta_v2,
+        m.smooth_delta_v2, m.next_junction_v2,
+        1 if m.is_kinematic_move else 0,
+    )
+
+    buf = me_ffi.new("struct FlushedMoveResult[10]")
+    count = me_lib.motion_engine_flush_and_process(eng, buf, 10, 0)
+    assert count == 1
+
+    c_lib.trapq_finalize_moves(trapq, 9999.0, 0.0)
+    entries = extract_trapq_moves(c_ffi, c_lib, trapq, 0, 9999)
+    assert len(entries) > 0
+    assert entries[0]["print_time"] >= 8.5, (
+        f"Post-sync trapq at {entries[0]['print_time']:.3f}, expected >= 8.5"
+    )
+
+    c_lib.trapq_free(trapq)
+    me_lib.motion_engine_destroy(eng)
+
+
 def test_velocity_limits_update():
     """Velocity limits can be changed between moves."""
     me_ffi, me_lib = get_zig_ffi()
@@ -893,6 +984,9 @@ def main():
         test_zero_distance_move_rejected,
         test_multi_batch_flush,
         test_velocity_limits_update,
+        # Print_time sync (root cause of K3 homing failure)
+        test_flush_and_process_with_print_time,
+        test_sync_state_then_flush,
     ]
     passed = 0
     failed = 0
