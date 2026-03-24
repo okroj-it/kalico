@@ -490,6 +490,17 @@ class ToolHead:
         queue = self._native_move_queue
         if not queue:
             return
+        # Resync print_time BEFORE flush (Zig needs correct base time
+        # for trapq_append, same as _process_moves does at its start)
+        if self.special_queuing_state:
+            if self.special_queuing_state != "Drip":
+                self.special_queuing_state = ""
+                self.need_check_pause = -1.0
+            self._calc_print_time()
+        # Sync print_time to Zig engine before trapq_append
+        self._me_lib.motion_engine_set_print_time(
+            self._native_engine, self.print_time
+        )
         # Zig: lookahead flush + trapq_append (XYZ + extruder)
         count = self._me_lib.motion_engine_flush_and_process(
             self._native_engine,
@@ -499,12 +510,6 @@ class ToolHead:
         )
         if count <= 0:
             return
-        # Resync print_time if necessary
-        if self.special_queuing_state:
-            if self.special_queuing_state != "Drip":
-                self.special_queuing_state = ""
-                self.need_check_pause = -1.0
-            self._calc_print_time()
         # Calculate next_move_time from extracted timing data
         next_move_time = self.print_time
         results = self._flush_results
