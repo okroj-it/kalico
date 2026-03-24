@@ -486,6 +486,118 @@ export fn motion_engine_flush_step_generation(eng: *MotionEngine) void {
     eng.flushStepGeneration();
 }
 
+/// Flush lookahead, resolve junction speeds, append to trapqs (XYZ + extruder).
+/// Returns count of processed moves. Timing data written to results buffer.
+/// Does NOT call itersolve or steppersync — Python orchestrates those via
+/// motion_engine_generate_steps from _advance_flush_time.
+export fn motion_engine_flush_and_process(
+    eng: *MotionEngine,
+    results: [*]FlushedMoveResult,
+    max_results: u32,
+    lazy: i32,
+) i32 {
+    const flush_count = eng.lookahead.flush(lazy != 0);
+    if (flush_count == 0) return 0;
+
+    const moves = eng.lookahead.getFlushedMoves(flush_count);
+    const count = @min(flush_count, @as(usize, max_results));
+
+    // Append to trapqs (XYZ + extruder) — the per-move work
+    var next_move_time = eng.print_time;
+    for (0..count) |i| {
+        const m = &moves[i];
+
+        if (m.is_kinematic_move) {
+            if (eng.trapq) |tq| {
+                c.trapq_append(
+                    tq,
+                    next_move_time,
+                    m.accel_t,
+                    m.cruise_t,
+                    m.decel_t,
+                    m.start_pos[0],
+                    m.start_pos[1],
+                    m.start_pos[2],
+                    m.axes_r[0],
+                    m.axes_r[1],
+                    m.axes_r[2],
+                    m.start_v,
+                    m.cruise_v,
+                    m.accel,
+                );
+            }
+        }
+
+        if (m.axes_d[3] != 0.0) {
+            if (eng.extruder_trapq) |etq| {
+                const axis_r = m.axes_r[3];
+                var pa = eng.extruder_pressure_advance;
+                if (axis_r <= 0.0 or (m.axes_d[0] == 0.0 and m.axes_d[1] == 0.0)) {
+                    pa = 0.0;
+                }
+                c.trapq_append(
+                    etq,
+                    next_move_time,
+                    m.accel_t,
+                    m.cruise_t,
+                    m.decel_t,
+                    m.start_pos[3],
+                    0.0,
+                    0.0,
+                    1.0,
+                    pa,
+                    eng.extruder_use_pa_from_trapq,
+                    m.start_v * axis_r,
+                    m.cruise_v * axis_r,
+                    m.accel * axis_r,
+                );
+            }
+        }
+
+        // Extract timing data for Python (timing_callbacks, print_time advance)
+        results[i] = .{
+            .start_v = m.start_v,
+            .cruise_v = m.cruise_v,
+            .end_v = m.end_v,
+            .accel_t = m.accel_t,
+            .cruise_t = m.cruise_t,
+            .decel_t = m.decel_t,
+            .accel = m.accel,
+        };
+
+        next_move_time += m.accel_t + m.cruise_t + m.decel_t;
+    }
+
+    eng.print_time = next_move_time;
+    eng.lookahead.consumeMoves(flush_count);
+    return @intCast(count);
+}
+
+/// Generate steps for all registered steppers up to sg_flush_time.
+/// Called from Python's _advance_flush_time dispatch.
+export fn motion_engine_generate_steps(eng: *MotionEngine, sg_flush_time: f64) i32 {
+    for (eng.steppers[0..eng.stepper_count]) |entry| {
+        const ret = c.itersolve_generate_steps(entry.sk, sg_flush_time);
+        if (ret != 0) return ret;
+    }
+    return 0;
+}
+
+/// Finalize trapq entries older than free_time.
+/// Called from Python's _advance_flush_time dispatch.
+export fn motion_engine_finalize_trapqs(
+    eng: *MotionEngine,
+    free_time: f64,
+    clear_history_time: f64,
+) void {
+    if (eng.trapq) |tq| {
+        c.trapq_finalize_moves(tq, free_time, clear_history_time);
+    }
+    if (eng.extruder_trapq) |etq| {
+        c.trapq_finalize_moves(etq, free_time, clear_history_time);
+    }
+}
+
 /// Flush lookahead and extract results (for hybrid Python integration fallback).
 export fn motion_engine_flush_and_extract(
     eng: *MotionEngine,

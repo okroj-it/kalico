@@ -299,6 +299,12 @@ defs_motion_engine = """
     };
     int motion_engine_flush_and_extract(struct MotionEngine *engine
         , struct FlushedMoveResult *results, uint32_t max_results, int lazy);
+    int motion_engine_flush_and_process(struct MotionEngine *engine
+        , struct FlushedMoveResult *results, uint32_t max_results, int lazy);
+    int motion_engine_generate_steps(struct MotionEngine *engine
+        , double sg_flush_time);
+    void motion_engine_finalize_trapqs(struct MotionEngine *engine
+        , double free_time, double clear_history_time);
 
     struct ClockSync *clock_sync_create(double mcu_freq);
     void clock_sync_destroy(struct ClockSync *cs);

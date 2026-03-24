@@ -484,13 +484,14 @@ class ToolHead:
             self._check_pause()
 
     def _native_flush(self, lazy=False):
-        """Flush native lookahead, apply velocity profiles to Python
-        Moves, then run existing _process_moves unchanged."""
+        """Flush native lookahead + append to trapqs (Zig), then advance
+        time and flush MCUs (Python)."""
         self.lookahead.junction_flush = LOOKAHEAD_FLUSH_TIME
         queue = self._native_move_queue
         if not queue:
             return
-        count = self._me_lib.motion_engine_flush_and_extract(
+        # Zig: lookahead flush + trapq_append (XYZ + extruder)
+        count = self._me_lib.motion_engine_flush_and_process(
             self._native_engine,
             self._flush_results,
             min(len(queue), 4096),
@@ -498,19 +499,36 @@ class ToolHead:
         )
         if count <= 0:
             return
+        # Resync print_time if necessary
+        if self.special_queuing_state:
+            if self.special_queuing_state != "Drip":
+                self.special_queuing_state = ""
+                self.need_check_pause = -1.0
+            self._calc_print_time()
+        # Calculate next_move_time from extracted timing data
+        next_move_time = self.print_time
         results = self._flush_results
-        moves = queue[:count]
         for i in range(count):
             r = results[i]
-            moves[i].set_junction(
-                r.start_v * r.start_v,
-                r.cruise_v * r.cruise_v,
-                r.end_v * r.end_v,
-            )
+            next_move_time += r.accel_t + r.cruise_t + r.decel_t
+            # Handle timing_callbacks (rare, from extras)
+            m = queue[i]
+            if m.timing_callbacks:
+                for cb in m.timing_callbacks:
+                    cb(next_move_time)
+        # Sync print_time from Zig engine
+        self.print_time = self._me_lib.motion_engine_get_print_time(
+            self._native_engine
+        )
         del queue[:count]
-        # Run existing _process_moves — handles trapq_append, extruder,
-        # step generators, MCU flush, timing callbacks. Unchanged.
-        self._process_moves(moves)
+        # Python: advance time, generate steps (via Zig dispatch in
+        # _advance_flush_time), flush MCUs
+        if self.special_queuing_state:
+            self._update_drip_move_time(next_move_time)
+        self.note_mcu_movequeue_activity(
+            next_move_time + self.kin_flush_delay, set_step_gen_time=True
+        )
+        self._advance_move_time(next_move_time)
 
     def _native_flush_lookahead(self):
         """Full flush of native lookahead."""
@@ -521,7 +539,8 @@ class ToolHead:
         self.check_stall_time = 0.0
 
     def _native_flush_step_generation(self):
-        """Flush everything including step generation."""
+        """Flush everything including step generation.
+        _advance_flush_time dispatches itersolve to Zig automatically."""
         self._native_flush_lookahead()
         self._advance_flush_time(self.step_gen_time)
         self.min_restart_time = max(self.min_restart_time, self.print_time)
@@ -535,17 +554,62 @@ class ToolHead:
             self.print_time - self.kin_flush_delay,
         )
         sg_flush_time = max(sg_flush_want, flush_time)
-        for sg in self.step_generators:
-            sg(sg_flush_time)
+        # Step generation: Zig or Python, never both
+        if self._native_engine is not None:
+            # Handle rare active_callbacks (motor auto-enable) in Python
+            for sg in self.step_generators:
+                stepper = sg.__self__
+                if hasattr(stepper, '_active_callbacks'):
+                    if stepper._active_callbacks:
+                        sk = stepper._stepper_kinematics
+                        ffi_main, ffi_lib = chelper.get_ffi()
+                        ret = ffi_lib.itersolve_check_active(
+                            sk, sg_flush_time
+                        )
+                        if ret:
+                            cbs = stepper._active_callbacks
+                            stepper._active_callbacks = []
+                            for cb in cbs:
+                                cb(ret)
+                elif hasattr(stepper, 'steppers'):
+                    for s in stepper.steppers:
+                        if s._active_callbacks:
+                            sk = s._stepper_kinematics
+                            ffi_main, ffi_lib = chelper.get_ffi()
+                            ret = ffi_lib.itersolve_check_active(
+                                sk, sg_flush_time
+                            )
+                            if ret:
+                                cbs = s._active_callbacks
+                                s._active_callbacks = []
+                                for cb in cbs:
+                                    cb(ret)
+            # Zig handles itersolve for all steppers
+            ret = self._me_lib.motion_engine_generate_steps(
+                self._native_engine, sg_flush_time
+            )
+            if ret:
+                raise self.printer.command_error(
+                    "Internal error in native stepcompress"
+                )
+        else:
+            for sg in self.step_generators:
+                sg(sg_flush_time)
         self.min_restart_time = max(self.min_restart_time, sg_flush_time)
         # Free trapq entries that are no longer needed
         clear_history_time = self.clear_history_time
         if not self.can_pause:
             clear_history_time = flush_time - MOVE_HISTORY_EXPIRE
         free_time = sg_flush_time - self.kin_flush_delay
-        self.trapq_finalize_moves(self.trapq, free_time, clear_history_time)
+        # Trapq finalization: Zig or Python, never both
+        if self._native_engine is not None:
+            self._me_lib.motion_engine_finalize_trapqs(
+                self._native_engine, free_time, clear_history_time
+            )
+        else:
+            self.trapq_finalize_moves(self.trapq, free_time, clear_history_time)
         self.extruder.update_move_time(free_time, clear_history_time)
-        # Flush stepcompress and mcu steppersync
+        # Flush stepcompress and mcu steppersync — ALWAYS Python
         for m in self.all_mcus:
             m.flush_moves(flush_time, clear_history_time)
         self.last_flush_time = flush_time
@@ -794,6 +858,21 @@ class ToolHead:
     def set_extruder(self, extruder, extrude_pos):
         self.extruder = extruder
         self.commanded_pos[3] = extrude_pos
+        if self._native_engine is not None and hasattr(extruder, 'trapq'):
+            self._me_lib.motion_engine_set_extruder_trapq(
+                self._native_engine, extruder.trapq
+            )
+            pa = 0.0
+            pa_from_trapq = 0.0
+            icv = getattr(extruder, 'instant_corner_v', 0.0)
+            es = getattr(extruder, 'extruder_stepper', None)
+            if es is not None:
+                pa = es.pressure_advance
+                if es.per_move_pressure_advance:
+                    pa_from_trapq = 1.0
+            self._me_lib.motion_engine_set_extruder_params(
+                self._native_engine, pa, pa_from_trapq, icv
+            )
 
     def get_extruder(self):
         return self.extruder
